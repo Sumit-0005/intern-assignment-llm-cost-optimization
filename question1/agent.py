@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import all_articles_blob
+from shared.kb import load_article
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -32,22 +31,63 @@ def parse_resolution(text: str) -> TicketResolution:
     )
 
 
-_FEW_SHOT = """
-Example ticket resolutions (format to copy):
+_POLICY_FIELDS = (
+    "product_type",
+    "subscription_age_days",
+    "license_revealed",
+    "customized",
+    "damage_reported",
+    "delivered_days_ago",
+    "opened",
+)
 
-1. Unopened headphones, day 10 → {"action":"REFUND","kb_article":"returns-within-30-days"}
-2. Ebook, license shown → {"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
-3. Cracked custom mug → {"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
-4. Cracked stock mug, day 2 → {"action":"REPLACE","kb_article":"damage-replacement-7-days"}
-"""
+
+def _int(value: object, default: int) -> int:
+    return default if value is None else int(value)
+
+
+_SYSTEM_PROMPT = "\n".join(
+    [
+        "You are ShopAssist Tier-1 support. Choose exactly one action and its single KB article.",
+        "Actions: REFUND, REPLACE, SEND_ARTICLE, ESCALATE_TIER2.",
+        'Reply with ONLY JSON: {"action":"...","kb_article":"..."}',
+        "Examples: unopened physical within 30 days -> REFUND/returns-within-30-days; "
+        "revealed digital license -> SEND_ARTICLE/digital-license-no-refund.",
+    ]
+)
+
+
+def _applicable_article(order: dict) -> str:
+    note = ""
+    if order.get("product_type") == "subscription":
+        article_id = "subscription-cooling-off"
+    elif order.get("license_revealed"):
+        article_id = "digital-license-no-refund"
+    elif order.get("customized") and order.get("damage_reported"):
+        article_id = "custom-items-no-replace"
+    elif order.get("product_type") == "digital":
+        article_id = "digital-license-no-refund"
+        note = (
+            "\nNote: this policy applies only after the license is revealed; "
+            "the help center has no policy for an unrevealed license."
+        )
+    elif order.get("damage_reported"):
+        article_id = "damage-replacement-7-days"
+        if _int(order.get("delivered_days_ago"), 99) > 7:
+            note = (
+                "\nNote: this replacement policy covers reports within 7 days; "
+                "the help center has no policy for older damage reports."
+            )
+    else:
+        article_id = "returns-within-30-days"
+    return f"--- {article_id} ---\n{load_article(article_id)}{note}"
 
 
 class SupportCopilot:
     """
-    ShopAssist Tier-1 copilot (baseline).
+    ShopAssist Tier-1 copilot.
 
-    Given a support ticket + order snapshot, choose an action, cite the help-center
-    article, and draft the customer reply.
+    Given a support ticket and order facts, choose an action and KB article.
     """
 
     def __init__(self, session: CostSession | None = None):
@@ -58,29 +98,19 @@ class SupportCopilot:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
         thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
-
-        system = "\n\n".join(
-            [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
-                _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
-                (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
-                ),
-            ]
+        policy_order = {
+            key: order[key] for key in _POLICY_FIELDS if key in order
+        }
+        snapshot = json.dumps(policy_order, separators=(",", ":"))
+        user = (
+            f"TICKET {ticket_id}\n{thread}\n"
+            f"ORDER_SNAPSHOT:{snapshot}END_SNAPSHOT\n"
+            f"HELP CENTER:\n{_applicable_article(policy_order)}"
         )
-        user = "\n\n".join(
-            [
-                f"TICKET_ID: {ticket_id}",
-                f"THREAD:\n{thread}",
-                f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ]
-        )
-        return [ChatMessage("system", system), ChatMessage("user", user)]
+        return [
+            ChatMessage("system", _SYSTEM_PROMPT),
+            ChatMessage("user", user),
+        ]
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         messages = self.build_messages(ticket_id)
